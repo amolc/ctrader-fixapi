@@ -1,10 +1,45 @@
+"""
+Multi-Account FIX API Trading Client for cTrader.
+
+This module provides functionality to execute trades across multiple cTrader accounts
+simultaneously using the FIX (Financial Information eXchange) protocol. It supports
+operations including querying positions, placing buy/sell orders, and closing positions.
+
+Key Components:
+    - load_env_file: Load environment variables from .env file
+    - get_env: Retrieve environment variables with defaults and validation
+    - str_to_bool: Convert string values to boolean
+    - value_at: Safely access list elements by index
+    - AccountSession: Represents a single trading account session with FIX connection
+    - MultiTradeManager: Manages multiple account sessions and coordinates trading operations
+    - load_accounts_from_csv: Load account configurations from CSV file
+
+Usage:
+    Set MULTI_TRADE_CSV environment variable to point to your accounts CSV file,
+    then run: python multitrade.py
+
+Environment Variables:
+    MULTI_TRADE_CSV: Path to CSV file containing account configurations (default: accounts.csv)
+
+CSV Format:
+    Required columns: FIX_USERNAME, FIX_PASSWORD, FIX_SENDER_COMP_ID, TRADE_HOST,
+                      TRADE_PORT, TRADE_SENDER_SUB_ID, TRADE_TARGET_SUB_ID
+    Optional columns: ACCOUNT_NAME, TRADE_ACTION, TRADE_SYMBOL, TRADE_QTY,
+                      TRADE_TIMEOUT, FIX_RESET_SEQ_NUM, TRADE_SSL, TRADE_POSITION_ID,
+                      FIX_BEGIN_STRING, FIX_TARGET_COMP_ID, FIX_HEARTBEAT
+
+Author: QuantMachine Team
+Date: April 2026
+"""
+
 import csv
 import importlib
 import os
 import sys
 import uuid
 
-ctrader_fix = importlib.import_module("ctrader_fix")
+# Import ctrader_fix module dynamically to handle potential import variations
+trader_fix = importlib.import_module("ctrader_fix")
 Client = ctrader_fix.Client
 LogonRequest = ctrader_fix.LogonRequest
 NewOrderSingle = ctrader_fix.NewOrderSingle
@@ -13,6 +48,23 @@ reactor = ctrader_fix.reactor
 
 
 def load_env_file(path: str) -> None:
+    """
+    Load environment variables from a .env file.
+
+    Parses a dotenv-style file and sets environment variables. Lines starting with
+    '#' are treated as comments and ignored. Variables already set in the environment
+    are not overwritten.
+
+    Args:
+        path: Path to the .env file to load.
+
+    Returns:
+        None
+
+    Example:
+        >>> load_env_file(".env")
+        # Loads KEY=value pairs from .env into os.environ
+    """
     if not os.path.exists(path):
         return
     with open(path, "r", encoding="utf-8") as file:
@@ -28,6 +80,31 @@ def load_env_file(path: str) -> None:
 
 
 def get_env(name: str, default: str | None = None, required: bool = False) -> str:
+    """
+    Retrieve environment variable with optional default value and validation.
+
+    Safely retrieves environment variables with support for default values
+    and required field validation. Raises ValueError if a required variable
+    is missing or empty.
+
+    Args:
+        name: Name of the environment variable to retrieve.
+        default: Default value if variable is not set. Defaults to None.
+        required: If True, raises ValueError when variable is missing/empty.
+                  Defaults to False.
+
+    Returns:
+        str: The environment variable value, default, or empty string.
+
+    Raises:
+        ValueError: If required=True and the variable is missing or empty.
+
+    Example:
+        >>> get_env("API_KEY", required=True)
+        'secret_key_value'
+        >>> get_env("OPTIONAL_VAR", "default_value")
+        'default_value'
+    """
     value = os.getenv(name, default)
     if required and (value is None or value == ""):
         raise ValueError(f"Missing required environment variable: {name}")
@@ -35,12 +112,59 @@ def get_env(name: str, default: str | None = None, required: bool = False) -> st
 
 
 def str_to_bool(value: str | bool) -> bool:
+    """
+    Convert a string or boolean value to boolean.
+
+    Converts various string representations to boolean values.
+    Case-insensitive matching for: '1', 'true', 'yes', 'on', 'y'.
+    All other values return False.
+
+    Args:
+        value: Value to convert. Can be a string or boolean.
+
+    Returns:
+        bool: True if value represents a truthy string/bool, False otherwise.
+
+    Examples:
+        >>> str_to_bool("true")
+        True
+        >>> str_to_bool("FALSE")
+        False
+        >>> str_to_bool(True)
+        True
+        >>> str_to_bool("yes")
+        True
+        >>> str_to_bool("no")
+        False
+    """
     if isinstance(value, bool):
         return value
     return str(value).lower() in {"1", "true", "yes", "on", "y"}
 
 
 def value_at(value, idx: int):
+    """
+    Safely access an element from a list by index.
+
+    Provides safe list element access with bounds checking.
+    Returns None if index is out of bounds or value is not a list.
+
+    Args:
+        value: List to access. If not a list, returns None.
+        idx: Zero-based index of the element to retrieve.
+
+    Returns:
+        The element at the specified index, or None if out of bounds
+        or if value is not a list.
+
+    Examples:
+        >>> value_at(["a", "b", "c"], 1)
+        'b'
+        >>> value_at(["a", "b"], 5)
+        None
+        >>> value_at("not a list", 0)
+        None
+    """
     if isinstance(value, list):
         if idx < len(value):
             return value[idx]
@@ -49,7 +173,59 @@ def value_at(value, idx: int):
 
 
 class AccountSession:
+    """
+    Represents a single trading account session with FIX connection.
+
+    This class encapsulates all configuration and state for a cTrader account
+    connection via the FIX protocol. It handles account identification,
+    trade configuration, and session state management.
+
+    Attributes:
+        row: Dictionary containing raw account configuration from CSV.
+        account_name: Human-readable account identifier.
+        action: Trading action to perform ("positions", "buy", "sell", "close").
+        symbol_requested: Original symbol string from configuration.
+        symbol: Resolved symbol ID for trading.
+        quantity: Trade quantity for buy/sell operations.
+        timeout_seconds: Session timeout before auto-disconnect.
+        reset_seq_num: Whether to reset FIX sequence numbers on logon.
+        close_position_id: Specific position ID to close (optional).
+        trade_config: Dictionary of FIX connection parameters.
+        client: FIX protocol client instance.
+        logged_in: Whether the session has completed logon.
+        completed: Whether the session has finished all operations.
+        sent_id: Most recently sent message ID for correlation.
+        position_reports_count: Number of position reports received.
+        collected_positions: List of collected position dictionaries.
+        timeout_call: Twisted timeout call handle.
+        positions_finish_call: Twisted delayed call for position operations.
+
+    Example:
+        >>> row = {
+        ...     "FIX_USERNAME": "user123",
+        ...     "FIX_PASSWORD": "secret",
+        ...     "FIX_SENDER_COMP_ID": "sender1",
+        ...     "TRADE_HOST": "fix.ctrader.com",
+        ...     "TRADE_PORT": "5001",
+        ...     "TRADE_SENDER_SUB_ID": "sub1",
+        ...     "TRADE_TARGET_SUB_ID": "target1",
+        ...     "TRADE_ACTION": "buy",
+        ...     "TRADE_SYMBOL": "BTCUSD",
+        ...     "TRADE_QTY": "0.01",
+        ... }
+        >>> session = AccountSession(row)
+        >>> session.account_name
+        'user123'
+    """
+
     def __init__(self, row: dict):
+        """
+        Initialize account session from CSV row data.
+
+        Args:
+            row: Dictionary containing account configuration from CSV.
+                 Must include required FIX connection parameters.
+        """
         self.row = {key.strip(): (value or "").strip() for key, value in row.items()}
         self.account_name = self.row.get("ACCOUNT_NAME") or self.row.get("FIX_USERNAME")
         self.action = (self.row.get("TRADE_ACTION") or "positions").lower()
@@ -87,6 +263,24 @@ class AccountSession:
         self.positions_finish_call = None
 
     def resolve_symbol_id(self, symbol: str) -> str:
+        """
+        Resolve symbol name to trading ID.
+
+        Checks if symbol is a numeric ID, then looks for environment variable
+        mapping (SYMBOL_{SYMBOL}_ID), otherwise returns the symbol as-is.
+
+        Args:
+            symbol: Symbol string to resolve.
+
+        Returns:
+            str: Resolved symbol ID for trading.
+
+        Examples:
+            >>> session.resolve_symbol_id("12345")
+            '12345'
+            >>> session.resolve_symbol_id("BTCUSD")
+            'BTCUSD'  # or value from SYMBOL_BTCUSD_ID env var
+        """
         if symbol.isdigit():
             return symbol
         env_key = f"SYMBOL_{symbol.upper()}_ID"
@@ -96,10 +290,46 @@ class AccountSession:
 
 
 class MultiTradeManager:
+    """
+    Manages multiple account sessions and coordinates trading operations.
+
+    This class orchestrates trading operations across multiple cTrader accounts
+    simultaneously. It handles connection management, message routing, and
+    lifecycle management for all account sessions.
+
+    Attributes:
+        sessions: List of AccountSession instances to manage.
+
+    Example:
+        >>> sessions = load_accounts_from_csv("accounts.csv")
+        >>> manager = MultiTradeManager(sessions)
+        >>> manager.start()
+    """
+
     def __init__(self, sessions: list[AccountSession]):
+        """
+        Initialize the manager with a list of account sessions.
+
+        Args:
+            sessions: List of AccountSession instances to coordinate.
+        """
         self.sessions = sessions
 
     def start(self) -> None:
+        """
+        Start all account sessions and begin the FIX event loop.
+
+        Initializes connections for all configured accounts, sets up callbacks,
+        and starts the Twisted reactor event loop. This method blocks until
+        all sessions complete or timeout.
+
+        Returns:
+            None
+
+        Note:
+            This method blocks and runs the Twisted reactor. It will not
+            return until all trading operations complete or timeout.
+        """
         if not self.sessions:
             print("No account sessions found")
             return
@@ -112,6 +342,19 @@ class MultiTradeManager:
         reactor.run()
 
     def on_connected(self, session: AccountSession, client: Client) -> None:
+        """
+        Handle FIX connection establishment for a session.
+
+        Called when the FIX client successfully establishes a TCP connection.
+        Logs connection details and sends the FIX logon message.
+
+        Args:
+            session: AccountSession that connected.
+            client: FIX client instance.
+
+        Returns:
+            None
+        """
         print(f"[{session.account_name}] Connected")
         print(
             f"[{session.account_name}] "
@@ -123,6 +366,20 @@ class MultiTradeManager:
         client.send(logon)
 
     def on_disconnected(self, session: AccountSession, client: Client, reason) -> None:
+        """
+        Handle FIX disconnection for a session.
+
+        Called when the FIX client disconnects from the server. Marks the session
+        as completed and triggers shutdown if all sessions are done.
+
+        Args:
+            session: AccountSession that disconnected.
+            client: FIX client instance.
+            reason: Disconnection reason string.
+
+        Returns:
+            None
+        """
         print(f"[{session.account_name}] Disconnected: {reason}")
         if not session.completed:
             session.completed = True
@@ -336,6 +593,48 @@ class MultiTradeManager:
 
 
 def load_accounts_from_csv(csv_path: str) -> list[AccountSession]:
+    """
+    Load account configurations from a CSV file.
+
+    Reads account configurations from a CSV file, validates required columns,
+    and creates AccountSession instances for each valid row.
+
+    Required CSV columns:
+        FIX_USERNAME: Account username for FIX authentication.
+        FIX_PASSWORD: Account password for FIX authentication.
+        FIX_SENDER_COMP_ID: Sender Comp ID for FIX protocol.
+        TRADE_HOST: FIX server hostname or IP address.
+        TRADE_PORT: FIX server port number.
+        TRADE_SENDER_SUB_ID: Sender Sub ID for FIX protocol.
+        TRADE_TARGET_SUB_ID: Target Sub ID for FIX protocol.
+
+    Optional CSV columns:
+        ACCOUNT_NAME: Human-readable account name (defaults to FIX_USERNAME).
+        TRADE_ACTION: Action to perform - positions, buy, sell, close (default: positions).
+        TRADE_SYMBOL: Trading symbol (default: BTCUSD).
+        TRADE_QTY: Trade quantity for buy/sell (default: 0.01).
+        TRADE_TIMEOUT: Session timeout in seconds (default: 20).
+        FIX_RESET_SEQ_NUM: Reset sequence numbers on logon (default: true).
+        TRADE_SSL: Use SSL connection (default: false).
+        TRADE_POSITION_ID: Specific position ID to close.
+        FIX_BEGIN_STRING: FIX protocol version (default: FIX.4.4).
+        FIX_TARGET_COMP_ID: Target Comp ID (default: cServer).
+        FIX_HEARTBEAT: Heartbeat interval in seconds (default: 30).
+
+    Args:
+        csv_path: Path to the CSV file containing account configurations.
+
+    Returns:
+        list[AccountSession]: List of initialized AccountSession instances.
+
+    Raises:
+        ValueError: If CSV file not found, required columns missing, or invalid TRADE_ACTION.
+
+    Example:
+        >>> sessions = load_accounts_from_csv("accounts.csv")
+        >>> len(sessions)
+        3
+    """
     if not os.path.exists(csv_path):
         raise ValueError(f"CSV file not found: {csv_path}")
     with open(csv_path, "r", encoding="utf-8", newline="") as file:
@@ -365,6 +664,22 @@ def load_accounts_from_csv(csv_path: str) -> list[AccountSession]:
 
 
 def main() -> int:
+    """
+    Main entry point for the multi-account trading client.
+
+    Loads environment variables from .env file, reads account configurations
+    from CSV, initializes the MultiTradeManager, and starts trading operations.
+
+    Environment Variables:
+        MULTI_TRADE_CSV: Path to accounts CSV file (default: accounts.csv).
+
+    Returns:
+        int: Exit code - 0 for success, 1 for error.
+
+    Example:
+        >>> import sys
+        >>> sys.exit(main())
+    """
     load_env_file(".env")
     csv_path = get_env("MULTI_TRADE_CSV", "accounts.csv")
     try:
