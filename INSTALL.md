@@ -392,17 +392,193 @@ Called when the FIX client disconnects from the server. Marks the session as com
 
 ## Trading Actions
 
+The trading actions are specified via the `TRADE_ACTION` column in the CSV file. Each action has specific behavior and requirements.
+
+---
+
 ### `positions`
-Query all open positions for the account. Returns position details including symbol, quantity, and settlement price.
+
+Query all open positions for the account.
+
+**Behavior:**
+- Sends a `RequestForPositions` FIX message to retrieve all open positions
+- Collects position reports including symbol, quantity, and settlement price
+- Automatically completes after receiving all position reports or timeout
+
+**Returns:**
+List of position dictionaries with the following fields:
+- `position_id`: Unique identifier for the position
+- `symbol`: Trading symbol (e.g., BTCUSD)
+- `long_qty`: Long position quantity
+- `short_qty`: Short position quantity
+- `settl_price`: Settlement price of the position
+
+**CSV Example:**
+```csv
+FIX_USERNAME,FIX_PASSWORD,FIX_SENDER_COMP_ID,TRADE_HOST,TRADE_PORT,TRADE_SENDER_SUB_ID,TRADE_TARGET_SUB_ID,TRADE_ACTION,TRADE_SYMBOL
+demo1,pass1,sender1,fix.ctrader.com,5001,sub1,target1,positions,BTCUSD
+```
+
+**Output Example:**
+```
+[Account 1] Positions request sent: PosReqID=POS-ABC123XYZ789
+[Account 1] Position report count=3
+```
+
+---
 
 ### `buy`
+
 Place a market buy order for the specified symbol and quantity.
 
+**Behavior:**
+- Sends a `NewOrderSingle` FIX message with side="1" (Buy)
+- Uses market order type (OrdType="1")
+- Order quantity is taken from `TRADE_QTY` column
+- Symbol is resolved via `resolve_symbol_id()`
+
+**Required CSV Columns:**
+- `TRADE_ACTION`: Must be "buy"
+- `TRADE_SYMBOL`: Symbol to buy (e.g., BTCUSD)
+- `TRADE_QTY`: Quantity to purchase (e.g., 0.01)
+
+**Returns:**
+Execution report with the following fields:
+- `exec_type`: Execution type (e.g., "0" for New, "2" for Filled)
+- `ord_status`: Order status (e.g., "0" for New, "2" for Filled)
+- `order_id`: Unique order identifier
+- `symbol`: Executed symbol
+- `side`: Side of order ("1" for Buy)
+- `filled_qty`: Actually filled quantity
+- `avg_px`: Average execution price
+- `text`: Additional text information
+
+**CSV Example:**
+```csv
+FIX_USERNAME,FIX_PASSWORD,FIX_SENDER_COMP_ID,TRADE_HOST,TRADE_PORT,TRADE_SENDER_SUB_ID,TRADE_TARGET_SUB_ID,TRADE_ACTION,TRADE_SYMBOL,TRADE_QTY
+demo2,pass2,sender2,fix.ctrader.com,5001,sub2,target2,buy,BTCUSD,0.01
+```
+
+**Output Example:**
+```
+[Account 2] Connected
+[Account 2] Order sent: ClOrdID=ORD-ABC123XYZ789, symbol=BTCUSD, side=1, qty=0.01
+[Account 2] Order update: {'exec_type': '2', 'ord_status': '2', 'order_id': '12345', ...}
+```
+
+---
+
 ### `sell`
+
 Place a market sell order for the specified symbol and quantity.
 
+**Behavior:**
+- Sends a `NewOrderSingle` FIX message with side="2" (Sell)
+- Uses market order type (OrdType="1")
+- Order quantity is taken from `TRADE_QTY` column
+- Symbol is resolved via `resolve_symbol_id()`
+
+**Required CSV Columns:**
+- `TRADE_ACTION`: Must be "sell"
+- `TRADE_SYMBOL`: Symbol to sell (e.g., BTCUSD)
+- `TRADE_QTY`: Quantity to sell (e.g., 0.01)
+
+**Returns:**
+Execution report with the following fields:
+- `exec_type`: Execution type (e.g., "0" for New, "2" for Filled)
+- `ord_status`: Order status (e.g., "0" for New, "2" for Filled)
+- `order_id`: Unique order identifier
+- `symbol`: Executed symbol
+- `side`: Side of order ("2" for Sell)
+- `filled_qty`: Actually filled quantity
+- `avg_px`: Average execution price
+- `text`: Additional text information
+
+**CSV Example:**
+```csv
+FIX_USERNAME,FIX_PASSWORD,FIX_SENDER_COMP_ID,TRADE_HOST,TRADE_PORT,TRADE_SENDER_SUB_ID,TRADE_TARGET_SUB_ID,TRADE_ACTION,TRADE_SYMBOL,TRADE_QTY
+demo3,pass3,sender3,fix.ctrader.com,5001,sub3,target3,sell,BTCUSD,0.01
+```
+
+**Output Example:**
+```
+[Account 3] Connected
+[Account 3] Order sent: ClOrdID=ORD-DEF456UVW012, symbol=BTCUSD, side=2, qty=0.01
+[Account 3] Order update: {'exec_type': '2', 'ord_status': '2', 'order_id': '67890', ...}
+```
+
+---
+
 ### `close`
-Close an existing position. Can target a specific position by ID or auto-close the first matching symbol.
+
+Close an existing position by sending an offsetting order.
+
+**Behavior:**
+1. First queries positions to find the target position
+2. If `TRADE_POSITION_ID` is specified, closes that specific position
+3. Otherwise, auto-closes the first position matching `TRADE_SYMBOL`
+4. Determines close side (Sell for Long positions, Buy for Short positions)
+5. Sends close order with the exact position quantity
+6. Includes `PosMaintRptID` to link the close to the original position
+
+**Required CSV Columns:**
+- `TRADE_ACTION`: Must be "close"
+- `TRADE_SYMBOL`: Symbol to close (e.g., BTCUSD)
+
+**Optional CSV Columns:**
+- `TRADE_POSITION_ID`: Specific position ID to close (if not provided, auto-closes first matching symbol)
+
+**Returns:**
+Close order execution report with position reference.
+
+**Position Selection Logic:**
+- If `TRADE_POSITION_ID` is provided: Closes position with matching ID
+- If no position ID: Finds first position where `symbol == TRADE_SYMBOL` AND (`long_qty > 0` OR `short_qty > 0`)
+
+**Side Determination:**
+- If `long_qty > 0`: Sends Sell order (side="2")
+- If `short_qty > 0`: Sends Buy order (side="1")
+
+**Quantity:**
+- Uses the full position quantity (`long_qty` or `short_qty`)
+
+**CSV Examples:**
+
+Close by specific position ID:
+```csv
+FIX_USERNAME,FIX_PASSWORD,FIX_SENDER_COMP_ID,TRADE_HOST,TRADE_PORT,TRADE_SENDER_SUB_ID,TRADE_TARGET_SUB_ID,TRADE_ACTION,TRADE_SYMBOL,TRADE_POSITION_ID
+demo4,pass4,sender4,fix.ctrader.com,5001,sub4,target4,close,BTCUSD,123456789
+```
+
+Close by symbol (auto-select):
+```csv
+FIX_USERNAME,FIX_PASSWORD,FIX_SENDER_COMP_ID,TRADE_HOST,TRADE_PORT,TRADE_SENDER_SUB_ID,TRADE_TARGET_SUB_ID,TRADE_ACTION,TRADE_SYMBOL
+demo5,pass5,sender5,fix.ctrader.com,5001,sub5,target5,close,BTCUSD
+```
+
+**Output Example:**
+```
+[Account 4] Connected
+[Account 4] Close positions request sent: PosReqID=POS-GHI789JKL345
+[Account 4] Close candidate count added=1
+[Account 4] Close order sent: ClOrdID=CLS-MNO012PQR678, position_id=123456789, symbol=BTCUSD, side=2, qty=0.01
+[Account 4] Order update: {'exec_type': '2', 'ord_status': '2', ...}
+```
+
+**Error Cases:**
+- Position not found: "Close target not found for position_id={id} symbol={symbol}"
+- Position has no quantity: "Target has no open qty: {position}"
+
+---
+
+## Trading Action Summary Table
+
+| Action | Side | Requires QTY | Optional Position ID | Description |
+|--------|------|--------------|---------------------|-------------|
+| `positions` | N/A | No | No | Query all open positions |
+| `buy` | 1 (Buy) | Yes | No | Open long position |
+| `sell` | 2 (Sell) | Yes | No | Open short position |
+| `close` | Auto | No | Yes | Close existing position |
 
 ## Example Workflow
 
