@@ -39,7 +39,7 @@ import sys
 import uuid
 
 # Import ctrader_fix module dynamically to handle potential import variations
-trader_fix = importlib.import_module("ctrader_fix")
+ctrader_fix = importlib.import_module("ctrader_fix")
 Client = ctrader_fix.Client
 LogonRequest = ctrader_fix.LogonRequest
 NewOrderSingle = ctrader_fix.NewOrderSingle
