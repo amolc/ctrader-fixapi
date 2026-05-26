@@ -6,6 +6,7 @@ import uuid
 ctrader_fix = importlib.import_module("ctrader_fix")
 Client = ctrader_fix.Client
 LogonRequest = ctrader_fix.LogonRequest
+MarketDataRequest = ctrader_fix.MarketDataRequest
 NewOrderSingle = ctrader_fix.NewOrderSingle
 RequestForPositions = ctrader_fix.RequestForPositions
 reactor = ctrader_fix.reactor
@@ -74,7 +75,43 @@ def resolve_symbol_id(symbol: str) -> str:
     return defaults.get(symbol.upper(), symbol)
 
 
-def read_runtime_settings() -> tuple[str, str, float, int, bool, str]:
+def value_at(value, idx: int):
+    if isinstance(value, list):
+        if idx < len(value):
+            return value[idx]
+        return None
+    if idx == 0:
+        return value
+    return None
+
+
+def parse_optional_float(name: str) -> float | None:
+    raw_value = get_env(name, "").strip()
+    if raw_value == "":
+        return None
+    value = float(raw_value)
+    if value <= 0:
+        raise ValueError(f"{name} must be greater than 0 when provided")
+    return value
+
+
+def format_terminal_table(rows: list[tuple[str, str]]) -> str:
+    key_width = max(len("Field"), *(len(key) for key, _ in rows))
+    value_width = max(len("Value"), *(len(value) for _, value in rows))
+    border = f"+-{'-' * key_width}-+-{'-' * value_width}-+"
+    header = f"| {'Field'.ljust(key_width)} | {'Value'.ljust(value_width)} |"
+    body = [
+        f"| {key.ljust(key_width)} | {value.ljust(value_width)} |"
+        for key, value in rows
+    ]
+    return "\n".join([border, header, border, *body, border])
+
+
+def read_output_settings() -> bool:
+    return str_to_bool(get_env("MINIMAL_OUTPUT", "false"))
+
+
+def read_runtime_settings() -> tuple[str, str, float, int, bool, str, float | None, float | None]:
     action = get_env("TRADE_ACTION", "positions").lower()
     if action not in {"positions", "buy", "sell", "close"}:
         raise ValueError("TRADE_ACTION must be one of: positions, buy, sell, close")
@@ -83,7 +120,18 @@ def read_runtime_settings() -> tuple[str, str, float, int, bool, str]:
     timeout_seconds = int(get_env("TRADE_TIMEOUT", "20"))
     reset_seq_num = str_to_bool(get_env("FIX_RESET_SEQ_NUM", "true"))
     close_position_id = get_env("TRADE_POSITION_ID", "")
-    return action, symbol, quantity, timeout_seconds, reset_seq_num, close_position_id
+    take_profit_pct = parse_optional_float("EXIT_TAKE_PROFIT_PCT")
+    stop_loss_pct = parse_optional_float("EXIT_STOP_LOSS_PCT")
+    return (
+        action,
+        symbol,
+        quantity,
+        timeout_seconds,
+        reset_seq_num,
+        close_position_id,
+        take_profit_pct,
+        stop_loss_pct,
+    )
 
 
 class TradeRunner:
@@ -96,6 +144,10 @@ class TradeRunner:
         trade_config: dict,
         reset_seq_num: bool,
         close_position_id: str,
+        quote_config: dict | None,
+        take_profit_pct: float | None,
+        stop_loss_pct: float | None,
+        minimal_output: bool,
     ):
         self.action = action
         self.symbol = resolve_symbol_id(symbol)
@@ -105,6 +157,10 @@ class TradeRunner:
         self.trade_config = trade_config
         self.reset_seq_num = reset_seq_num
         self.close_position_id = close_position_id
+        self.quote_config = quote_config
+        self.take_profit_pct = take_profit_pct
+        self.stop_loss_pct = stop_loss_pct
+        self.minimal_output = minimal_output
         self.client = Client(
             self.trade_config["Host"],
             self.trade_config["Port"],
@@ -113,22 +169,54 @@ class TradeRunner:
         )
         self.client.setConnectedCallback(self.on_connected)
         self.client.setDisconnectedCallback(self.on_disconnected)
-        self.client.setMessageReceivedCallback(self.on_message)
+        self.client.setMessageReceivedCallback(self.on_trade_message)
+        self.quote_client = None
+        if self.should_monitor_exit():
+            self.quote_client = Client(
+                self.quote_config["Host"],
+                self.quote_config["Port"],
+                ssl=self.quote_config["SSL"],
+                delimiter="\x01",
+            )
+            self.quote_client.setConnectedCallback(self.on_quote_connected)
+            self.quote_client.setDisconnectedCallback(self.on_quote_disconnected)
+            self.quote_client.setMessageReceivedCallback(self.on_quote_message)
         self.logged_in = False
+        self.quote_logged_in = False
         self.completed = False
         self.sent_id = None
         self.position_reports_count = 0
         self.timeout_call = None
         self.collected_positions = []
+        self.entry_order_id = None
+        self.entry_side = None
+        self.entry_position_id = None
+        self.entry_avg_px = None
+        self.entry_filled_qty = None
+        self.exit_order_id = None
+        self.exit_reason = None
+        self.market_data_request_id = None
+        self.last_bid = None
+        self.last_ask = None
+        self.exit_triggered = False
 
     def start(self) -> None:
         self.timeout_call = reactor.callLater(self.timeout_seconds, self.on_timeout)
         self.client.startService()
         reactor.run()
 
+    def should_monitor_exit(self) -> bool:
+        return self.action in {"buy", "sell"} and (
+            self.take_profit_pct is not None or self.stop_loss_pct is not None
+        )
+
+    def log(self, message: str) -> None:
+        if not self.minimal_output:
+            print(message)
+
     def on_connected(self, client: Client) -> None:
-        print("Connected to cTrader TRADE FIX endpoint")
-        print(
+        self.log("Connected to cTrader TRADE FIX endpoint")
+        self.log(
             "Logon config: "
             f"host={self.trade_config['Host']} port={self.trade_config['Port']} ssl={self.trade_config['SSL']} "
             f"username={self.trade_config['Username']} sender_comp={self.trade_config['SenderCompID']} "
@@ -137,19 +225,34 @@ class TradeRunner:
             f"reset_seq_num={self.reset_seq_num}"
         )
         if self.symbol_requested != self.symbol:
-            print(f"Symbol mapping: requested={self.symbol_requested} resolved={self.symbol}")
+            self.log(f"Symbol mapping: requested={self.symbol_requested} resolved={self.symbol}")
         logon = LogonRequest(self.trade_config)
         logon.ResetSeqNum = self.reset_seq_num
         client.send(logon)
 
+    def on_quote_connected(self, client: Client) -> None:
+        self.log("Connected to cTrader QUOTE FIX endpoint for exit monitoring")
+        self.log(
+            "Quote logon config: "
+            f"host={self.quote_config['Host']} port={self.quote_config['Port']} ssl={self.quote_config['SSL']} "
+            f"sender_comp={self.quote_config['SenderCompID']} sender_sub={self.quote_config['SenderSubID']} "
+            f"target_comp={self.quote_config['TargetCompID']} target_sub={self.quote_config['TargetSubID']}"
+        )
+        logon = LogonRequest(self.quote_config)
+        logon.ResetSeqNum = self.reset_seq_num
+        client.send(logon)
+
     def on_disconnected(self, client: Client, reason) -> None:
-        print(f"Disconnected: {reason}")
+        self.log(f"Disconnected: {reason}")
         if reactor.running:
             reactor.stop()
 
-    def on_message(self, client: Client, response) -> None:
+    def on_quote_disconnected(self, client: Client, reason) -> None:
+        self.log(f"Quote disconnected: {reason}")
+
+    def on_trade_message(self, client: Client, response) -> None:
         msg_type = response.getFieldValue(35)
-        print(response.getMessage())
+        self.log(response.getMessage())
 
         if msg_type == "A" and not self.logged_in:
             self.logged_in = True
@@ -235,35 +338,13 @@ class TradeRunner:
         if self.action in {"buy", "sell", "close"} and msg_type == "8":
             cl_ord_id = response.getFieldValue(11)
             if self.id_matches(cl_ord_id):
-                result = {
-                    "exec_type": response.getFieldValue(150),
-                    "ord_status": response.getFieldValue(39),
-                    "order_id": response.getFieldValue(37),
-                    "symbol": response.getFieldValue(55),
-                    "side": response.getFieldValue(54),
-                    "filled_qty": response.getFieldValue(14),
-                    "avg_px": response.getFieldValue(6),
-                    "text": response.getFieldValue(58),
-                }
-                print(f"Order update: {result}")
-                self.finish()
+                self.handle_execution_report(response, "Order update")
                 return
 
         if self.action in {"buy", "sell", "close"} and isinstance(msg_type, list) and "8" in msg_type:
             cl_ord_id = response.getFieldValue(11)
             if self.id_matches(cl_ord_id):
-                result = {
-                    "exec_type": response.getFieldValue(150),
-                    "ord_status": response.getFieldValue(39),
-                    "order_id": response.getFieldValue(37),
-                    "symbol": response.getFieldValue(55),
-                    "side": response.getFieldValue(54),
-                    "filled_qty": response.getFieldValue(14),
-                    "avg_px": response.getFieldValue(6),
-                    "text": response.getFieldValue(58),
-                }
-                print(f"Order update(batch): {result}")
-                self.finish()
+                self.handle_execution_report(response, "Order update(batch)")
                 return
 
         if self.action in {"buy", "sell", "close"} and msg_type == "j":
@@ -291,13 +372,36 @@ class TradeRunner:
                 print(f"Business message reject(batch): {reject}")
                 self.finish()
 
+    def on_quote_message(self, client: Client, response) -> None:
+        msg_type = response.getFieldValue(35)
+        self.log(f"QUOTE {response.getMessage()}")
+
+        if msg_type == "A" and not self.quote_logged_in:
+            self.quote_logged_in = True
+            self.start_quote_subscription()
+            return
+
+        if self.has_message_type(msg_type, "W") or self.has_message_type(msg_type, "X"):
+            self.handle_market_data(response)
+            return
+
+        if self.has_message_type(msg_type, "j"):
+            reject = {
+                "ref_id": response.getFieldValue(379),
+                "ref_seq_num": response.getFieldValue(45),
+                "reason": response.getFieldValue(58),
+                "reject_reason_code": response.getFieldValue(380),
+            }
+            self.log(f"Quote business message reject: {reject}")
+            self.finish()
+
     def after_logon(self) -> None:
         if self.action == "positions":
             request = RequestForPositions(self.trade_config)
             self.sent_id = f"POS-{uuid.uuid4().hex[:12].upper()}"
             request.PosReqID = self.sent_id
             self.client.send(request)
-            print(f"Positions request sent: PosReqID={self.sent_id}")
+            self.log(f"Positions request sent: PosReqID={self.sent_id}")
             reactor.callLater(3, self.finish_positions)
             return
 
@@ -306,22 +410,182 @@ class TradeRunner:
             self.sent_id = f"POS-{uuid.uuid4().hex[:12].upper()}"
             request.PosReqID = self.sent_id
             self.client.send(request)
-            print(f"Close flow positions request sent: PosReqID={self.sent_id}")
+            self.log(f"Close flow positions request sent: PosReqID={self.sent_id}")
             reactor.callLater(3, self.execute_close_from_positions)
             return
 
         order = NewOrderSingle(self.trade_config)
-        self.sent_id = f"ORD-{uuid.uuid4().hex[:12].upper()}"
-        order.ClOrdID = self.sent_id
+        self.entry_order_id = f"ORD-{uuid.uuid4().hex[:12].upper()}"
+        self.sent_id = self.entry_order_id
+        self.entry_side = "1" if self.action == "buy" else "2"
+        order.ClOrdID = self.entry_order_id
         order.Symbol = self.symbol
-        order.Side = "1" if self.action == "buy" else "2"
+        order.Side = self.entry_side
         order.OrderQty = self.quantity
         order.OrdType = "1"
         self.client.send(order)
-        print(
-            f"{self.action.upper()} order sent: ClOrdID={self.sent_id}, "
+        self.log(
+            f"{self.action.upper()} order sent: ClOrdID={self.entry_order_id}, "
             f"symbol={self.symbol}, qty={self.quantity}"
         )
+
+    def handle_execution_report(self, response, label: str) -> None:
+        result = {
+            "exec_type": response.getFieldValue(150),
+            "ord_status": response.getFieldValue(39),
+            "order_id": response.getFieldValue(37),
+            "position_id": response.getFieldValue(721),
+            "symbol": response.getFieldValue(55),
+            "side": response.getFieldValue(54),
+            "filled_qty": response.getFieldValue(14),
+            "avg_px": response.getFieldValue(6),
+            "text": response.getFieldValue(58),
+        }
+        self.log(f"{label}: {result}")
+
+        if self.exit_order_id and self.id_matches(response.getFieldValue(11), self.exit_order_id):
+            if self.report_has_terminal_status(response):
+                self.emit_result_table("EXIT", result, reason=self.exit_reason)
+                self.log(f"Exit order completed via {self.exit_reason or 'manual exit'}")
+                self.finish()
+            return
+
+        if self.entry_order_id and self.id_matches(response.getFieldValue(11), self.entry_order_id):
+            if self.should_monitor_exit() and self.report_has_fill(response):
+                avg_px = self.pick_last_value(response.getFieldValue(6))
+                self.entry_avg_px = float(avg_px) if avg_px is not None else None
+                self.entry_filled_qty = float(self.pick_last_value(response.getFieldValue(14)) or 0)
+                self.entry_position_id = self.pick_last_value(response.getFieldValue(721))
+                if not self.entry_avg_px or not self.entry_position_id or self.entry_filled_qty <= 0:
+                    self.log("Filled entry missing avg_px, position_id, or qty; cannot start exit monitoring")
+                    self.finish()
+                    return
+                self.log(
+                    "Entry filled, starting exit monitoring: "
+                    f"entry_px={self.entry_avg_px} qty={self.entry_filled_qty} "
+                    f"position_id={self.entry_position_id} "
+                    f"tp={self.take_profit_price()} sl={self.stop_loss_price()}"
+                )
+                self.start_quote_monitoring()
+                return
+
+            if not self.should_monitor_exit() and self.report_has_terminal_status(response):
+                self.emit_result_table(self.action.upper(), result)
+                self.finish()
+                return
+
+            if self.should_monitor_exit() and self.report_is_rejected(response):
+                self.finish()
+
+        if self.action == "close" and self.report_has_terminal_status(response):
+            self.emit_result_table("CLOSE", result)
+            self.finish()
+
+    def start_quote_monitoring(self) -> None:
+        if self.quote_client is None:
+            self.log("Exit monitoring requested but QUOTE client is not configured")
+            self.finish()
+            return
+        if self.quote_client.running:
+            return
+        self.quote_client.startService()
+
+    def start_quote_subscription(self) -> None:
+        request = MarketDataRequest(self.quote_config)
+        self.market_data_request_id = f"MD-{uuid.uuid4().hex[:12].upper()}"
+        request.MDReqID = self.market_data_request_id
+        request.SubscriptionRequestType = "1"
+        request.MarketDepth = 1
+        request.MDUpdateType = 0
+        request.NoMDEntryTypes = 1
+        request.MDEntryType = "0"
+        request.NoRelatedSym = 1
+        request.Symbol = self.symbol
+        self.quote_client.send(request)
+        self.log(
+            "Quote market data request sent: "
+            f"MDReqID={self.market_data_request_id} symbol={self.symbol}"
+        )
+
+    def handle_market_data(self, response) -> None:
+        entry_types = response.getFieldValue(269)
+        prices = response.getFieldValue(270)
+        if isinstance(entry_types, list):
+            for idx, entry_type in enumerate(entry_types):
+                price = value_at(prices, idx)
+                self.record_market_price(entry_type, price)
+        else:
+            self.record_market_price(entry_types, prices)
+
+        self.log(
+            f"Exit monitor prices: bid={self.last_bid} ask={self.last_ask} "
+            f"tp={self.take_profit_price()} sl={self.stop_loss_price()}"
+        )
+        self.evaluate_exit()
+
+    def record_market_price(self, entry_type, price) -> None:
+        if price is None:
+            return
+        if entry_type == "0":
+            self.last_bid = float(price)
+        elif entry_type == "1":
+            self.last_ask = float(price)
+
+    def evaluate_exit(self) -> None:
+        if self.exit_triggered or self.entry_avg_px is None or self.entry_position_id is None:
+            return
+
+        tp_price = self.take_profit_price()
+        sl_price = self.stop_loss_price()
+
+        if self.entry_side == "1":
+            if tp_price is not None and self.last_bid is not None and self.last_bid >= tp_price:
+                self.send_exit_order("take-profit")
+                return
+            if sl_price is not None and self.last_bid is not None and self.last_bid <= sl_price:
+                self.send_exit_order("stop-loss")
+                return
+        elif self.entry_side == "2":
+            if tp_price is not None and self.last_ask is not None and self.last_ask <= tp_price:
+                self.send_exit_order("take-profit")
+                return
+            if sl_price is not None and self.last_ask is not None and self.last_ask >= sl_price:
+                self.send_exit_order("stop-loss")
+
+    def send_exit_order(self, reason: str) -> None:
+        if self.exit_triggered:
+            return
+        self.exit_triggered = True
+        self.exit_reason = reason
+        order = NewOrderSingle(self.trade_config)
+        self.exit_order_id = f"EXT-{uuid.uuid4().hex[:12].upper()}"
+        self.sent_id = self.exit_order_id
+        order.ClOrdID = self.exit_order_id
+        order.Symbol = self.symbol
+        order.Side = "2" if self.entry_side == "1" else "1"
+        order.OrderQty = self.entry_filled_qty
+        order.OrdType = "1"
+        order.PosMaintRptID = self.entry_position_id
+        self.client.send(order)
+        self.log(
+            "Exit order sent: "
+            f"reason={reason} ClOrdID={self.exit_order_id} position_id={self.entry_position_id} "
+            f"side={order.Side} qty={self.entry_filled_qty}"
+        )
+
+    def take_profit_price(self) -> float | None:
+        if self.take_profit_pct is None or self.entry_avg_px is None:
+            return None
+        if self.entry_side == "1":
+            return self.entry_avg_px * (1 + self.take_profit_pct / 100)
+        return self.entry_avg_px * (1 - self.take_profit_pct / 100)
+
+    def stop_loss_price(self) -> float | None:
+        if self.stop_loss_pct is None or self.entry_avg_px is None:
+            return None
+        if self.entry_side == "1":
+            return self.entry_avg_px * (1 - self.stop_loss_pct / 100)
+        return self.entry_avg_px * (1 + self.stop_loss_pct / 100)
 
     def execute_close_from_positions(self) -> None:
         if self.completed:
@@ -379,15 +643,92 @@ class TradeRunner:
         if self.completed:
             return
         if self.position_reports_count == 0:
-            print("No open positions returned")
+            self.log("No open positions returned")
         self.finish()
 
-    def id_matches(self, response_id) -> bool:
+    def emit_result_table(self, action_label: str, result: dict, reason: str | None = None) -> None:
+        rows = [
+            ("Account", self.trade_config["Username"]),
+            ("Action", action_label),
+            ("Symbol", self.symbol_requested),
+            ("Side", self.describe_side(self.pick_last_value(result.get("side")))),
+            ("Qty", str(self.pick_last_value(result.get("filled_qty")) or self.quantity)),
+            ("Order ID", str(self.pick_last_value(result.get("order_id")) or "")),
+            ("Position ID", str(self.pick_last_value(result.get("position_id")) or self.entry_position_id or self.close_position_id or "")),
+            ("Avg Price", str(self.pick_last_value(result.get("avg_px")) or "")),
+            ("Status", self.describe_status(result)),
+        ]
+        if reason:
+            rows.append(("Reason", reason))
+        print(format_terminal_table(rows))
+
+    @staticmethod
+    def pick_last_value(value):
+        if isinstance(value, list):
+            if value:
+                return value[-1]
+            return None
+        return value
+
+    @staticmethod
+    def describe_side(side: str | None) -> str:
+        mapping = {"1": "BUY", "2": "SELL"}
+        return mapping.get(side or "", side or "")
+
+    def describe_status(self, result: dict) -> str:
+        exec_type = self.pick_last_value(result.get("exec_type"))
+        ord_status = self.pick_last_value(result.get("ord_status"))
+        if exec_type in {"F", "2"} or ord_status == "2":
+            return "FILLED"
+        if exec_type == "8" or ord_status == "8":
+            return "REJECTED"
+        if exec_type == "0" or ord_status == "0":
+            return "NEW"
+        return str(exec_type or ord_status or "")
+
+    @staticmethod
+    def has_message_type(msg_type, expected: str) -> bool:
+        if isinstance(msg_type, list):
+            return expected in msg_type
+        return msg_type == expected
+
+    @staticmethod
+    def report_has_terminal_status(response) -> bool:
+        exec_type = response.getFieldValue(150)
+        ord_status = response.getFieldValue(39)
+        exec_values = exec_type if isinstance(exec_type, list) else [exec_type]
+        status_values = ord_status if isinstance(ord_status, list) else [ord_status]
+        return any(value in {"2", "4", "8", "C", "F"} for value in exec_values + status_values if value is not None)
+
+    @staticmethod
+    def report_has_fill(response) -> bool:
+        exec_type = response.getFieldValue(150)
+        ord_status = response.getFieldValue(39)
+        filled_qty = response.getFieldValue(14)
+        exec_values = exec_type if isinstance(exec_type, list) else [exec_type]
+        status_values = ord_status if isinstance(ord_status, list) else [ord_status]
+        fill_values = filled_qty if isinstance(filled_qty, list) else [filled_qty]
+        has_fill_status = any(value in {"1", "2", "F"} for value in exec_values + status_values if value is not None)
+        has_filled_qty = any(float(value or 0) > 0 for value in fill_values)
+        return has_fill_status and has_filled_qty
+
+    @staticmethod
+    def report_is_rejected(response) -> bool:
+        exec_type = response.getFieldValue(150)
+        ord_status = response.getFieldValue(39)
+        exec_values = exec_type if isinstance(exec_type, list) else [exec_type]
+        status_values = ord_status if isinstance(ord_status, list) else [ord_status]
+        return any(value in {"8"} for value in exec_values + status_values if value is not None)
+
+    def id_matches(self, response_id, expected_id=None) -> bool:
+        expected_id = expected_id or self.sent_id
+        if expected_id is None:
+            return False
         if response_id is None:
             return False
         if isinstance(response_id, list):
-            return self.sent_id in response_id
-        return response_id == self.sent_id
+            return expected_id in response_id
+        return response_id == expected_id
 
     def on_timeout(self) -> None:
         if self.completed:
@@ -402,6 +743,8 @@ class TradeRunner:
         if self.timeout_call and self.timeout_call.active():
             self.timeout_call.cancel()
         self.client.stopService()
+        if self.quote_client is not None:
+            self.quote_client.stopService()
         if reactor.running:
             reactor.callLater(0.1, reactor.stop)
 
@@ -409,8 +752,21 @@ class TradeRunner:
 def main() -> int:
     load_env_file(".env")
     try:
-        action, symbol, quantity, timeout_seconds, reset_seq_num, close_position_id = read_runtime_settings()
+        (
+            action,
+            symbol,
+            quantity,
+            timeout_seconds,
+            reset_seq_num,
+            close_position_id,
+            take_profit_pct,
+            stop_loss_pct,
+        ) = read_runtime_settings()
+        minimal_output = read_output_settings()
         trade_config = build_fix_config("TRADE")
+        quote_config = build_fix_config("QUOTE") if action in {"buy", "sell"} and (
+            take_profit_pct is not None or stop_loss_pct is not None
+        ) else None
         runner = TradeRunner(
             action=action,
             symbol=symbol,
@@ -419,6 +775,10 @@ def main() -> int:
             trade_config=trade_config,
             reset_seq_num=reset_seq_num,
             close_position_id=close_position_id,
+            quote_config=quote_config,
+            take_profit_pct=take_profit_pct,
+            stop_loss_pct=stop_loss_pct,
+            minimal_output=minimal_output,
         )
     except ValueError as error:
         print(error)
