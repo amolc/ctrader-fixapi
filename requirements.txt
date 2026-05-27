@@ -1,0 +1,4 @@
+ctrader-fix==0.1.1
+pandas==3.0.2
+pyopenssl>=24.0.0
+service-identity>=24.0.0
