@@ -2,6 +2,7 @@ import importlib
 import os
 import sys
 import uuid
+import threading
 
 ctrader_fix = importlib.import_module("ctrader_fix")
 Client = ctrader_fix.Client
@@ -9,7 +10,22 @@ LogonRequest = ctrader_fix.LogonRequest
 MarketDataRequest = ctrader_fix.MarketDataRequest
 NewOrderSingle = ctrader_fix.NewOrderSingle
 RequestForPositions = ctrader_fix.RequestForPositions
+OrderMassStatusRequest = ctrader_fix.OrderMassStatusRequest
 reactor = ctrader_fix.reactor
+
+_reactor_thread = None
+_reactor_lock = threading.Lock()
+
+def start_reactor_thread():
+    global _reactor_thread
+    with _reactor_lock:
+        if _reactor_thread is None:
+            _reactor_thread = threading.Thread(
+                target=reactor.run,
+                kwargs={"installSignalHandlers": False},
+                daemon=True
+            )
+            _reactor_thread.start()
 
 
 def load_env_file(path: str) -> None:
@@ -65,7 +81,9 @@ def build_fix_config(prefix: str) -> dict:
     }
 
 
-def resolve_symbol_id(symbol: str) -> str:
+def resolve_symbol_id(symbol: str | None) -> str | None:
+    if not symbol:
+        return symbol
     if symbol.isdigit():
         return symbol
     env_symbol = get_env(f"SYMBOL_{symbol.upper()}_ID", "")
@@ -113,8 +131,8 @@ def read_output_settings() -> bool:
 
 def read_runtime_settings() -> tuple[str, str, float, int, bool, str, float | None, float | None]:
     action = get_env("TRADE_ACTION", "positions").lower()
-    if action not in {"positions", "buy", "sell", "close"}:
-        raise ValueError("TRADE_ACTION must be one of: positions, buy, sell, close")
+    if action not in {"positions", "buy", "sell", "close", "transactions"}:
+        raise ValueError("TRADE_ACTION must be one of: positions, buy, sell, close, transactions")
     symbol = get_env("TRADE_SYMBOL", "BTCUSD")
     quantity = float(get_env("TRADE_QTY", "0.01"))
     timeout_seconds = int(get_env("TRADE_TIMEOUT", "20"))
@@ -199,11 +217,17 @@ class TradeRunner:
         self.last_bid = None
         self.last_ask = None
         self.exit_triggered = False
+        self.done_event = threading.Event()
+        self.collected_transactions = []
 
     def start(self) -> None:
+        start_reactor_thread()
+        reactor.callFromThread(self._start_on_reactor)
+        self.done_event.wait()
+
+    def _start_on_reactor(self) -> None:
         self.timeout_call = reactor.callLater(self.timeout_seconds, self.on_timeout)
         self.client.startService()
-        reactor.run()
 
     def should_monitor_exit(self) -> bool:
         return self.action in {"buy", "sell"} and (
@@ -244,8 +268,7 @@ class TradeRunner:
 
     def on_disconnected(self, client: Client, reason) -> None:
         self.log(f"Disconnected: {reason}")
-        if reactor.running:
-            reactor.stop()
+        self.finish()
 
     def on_quote_disconnected(self, client: Client, reason) -> None:
         self.log(f"Quote disconnected: {reason}")
@@ -335,6 +358,22 @@ class TradeRunner:
                     print(f"Close candidate(batch) #{idx + 1}: {position}")
             return
 
+        if self.action == "transactions" and (msg_type == "8" or (isinstance(msg_type, list) and "8" in msg_type)):
+            tx = {
+                "order_id": response.getFieldValue(37),
+                "cl_ord_id": response.getFieldValue(11),
+                "symbol": response.getFieldValue(55),
+                "side": response.getFieldValue(54),
+                "qty": response.getFieldValue(38),
+                "price": response.getFieldValue(44),
+                "avg_px": response.getFieldValue(6),
+                "cum_qty": response.getFieldValue(14),
+                "status": response.getFieldValue(39),
+                "exec_type": response.getFieldValue(150),
+            }
+            self.collected_transactions.append(tx)
+            return
+
         if self.action in {"buy", "sell", "close"} and msg_type == "8":
             cl_ord_id = response.getFieldValue(11)
             if self.id_matches(cl_ord_id):
@@ -396,6 +435,16 @@ class TradeRunner:
             self.finish()
 
     def after_logon(self) -> None:
+        if self.action == "transactions":
+            request = OrderMassStatusRequest(self.trade_config)
+            self.sent_id = f"MAS-{uuid.uuid4().hex[:12].upper()}"
+            request.MassStatusReqID = self.sent_id
+            request.MassStatusReqType = "7"
+            self.client.send(request)
+            self.log(f"Mass status request sent: MassStatusReqID={self.sent_id}")
+            reactor.callLater(3, self.finish_transactions)
+            return
+
         if self.action == "positions":
             request = RequestForPositions(self.trade_config)
             self.sent_id = f"POS-{uuid.uuid4().hex[:12].upper()}"
@@ -646,6 +695,44 @@ class TradeRunner:
             self.log("No open positions returned")
         self.finish()
 
+    def finish_transactions(self) -> None:
+        if self.completed:
+            return
+        if not self.collected_transactions:
+            print("No transactions found")
+        else:
+            print(f"Transactions list ({len(self.collected_transactions)} total):")
+            headers = ["Order ID", "Symbol", "Side", "Qty", "Avg Price", "Cum Qty", "Status"]
+            rows = []
+            for tx in self.collected_transactions:
+                order_id = self.pick_last_value(tx["order_id"]) or ""
+                symbol_id = self.pick_last_value(tx["symbol"]) or ""
+                symbol = next((k for k, v in {"BTCUSD": "101"}.items() if v == symbol_id), symbol_id)
+                side = self.describe_side(self.pick_last_value(tx["side"]))
+                qty = self.pick_last_value(tx["qty"]) or ""
+                avg_px = self.pick_last_value(tx["avg_px"]) or ""
+                cum_qty = self.pick_last_value(tx["cum_qty"]) or ""
+                status = self.describe_status(tx)
+                
+                rows.append([order_id, symbol, side, str(qty), str(avg_px), str(cum_qty), status])
+            
+            col_widths = [len(h) for h in headers]
+            for row in rows:
+                for idx, val in enumerate(row):
+                    col_widths[idx] = max(col_widths[idx], len(val))
+            
+            border = "+" + "+".join(f"-{'-' * w}-" for w in col_widths) + "+"
+            header_str = "|" + "|".join(f" {headers[idx].ljust(w)} " for idx, w in enumerate(col_widths)) + "|"
+            print(border)
+            print(header_str)
+            print(border)
+            for row in rows:
+                row_str = "|" + "|".join(f" {row[idx].ljust(w)} " for idx, w in enumerate(col_widths)) + "|"
+                print(row_str)
+            print(border)
+            
+        self.finish()
+
     def emit_result_table(self, action_label: str, result: dict, reason: str | None = None) -> None:
         rows = [
             ("Account", self.trade_config["Username"]),
@@ -745,11 +832,10 @@ class TradeRunner:
         self.client.stopService()
         if self.quote_client is not None:
             self.quote_client.stopService()
-        if reactor.running:
-            reactor.callLater(0.1, reactor.stop)
+        self.done_event.set()
 
 
-def main() -> int:
+def sell() -> int:
     load_env_file(".env")
     try:
         action = "sell"
@@ -786,5 +872,180 @@ def main() -> int:
     return 0
 
 
+
+def buy() -> int:
+    load_env_file(".env")
+    try:
+        action = "buy"
+        symbol = "BTCUSD"
+        quantity = 0.02
+        timeout_seconds = 30
+        reset_seq_num = True
+        close_position_id = None
+        take_profit_pct = None
+        stop_loss_pct = None
+        minimal_output = True
+        trade_config = build_fix_config("TRADE")
+        quote_config = build_fix_config("QUOTE") if action in {"buy", "sell"} and (
+            take_profit_pct is not None or stop_loss_pct is not None
+        ) else None
+        runner = TradeRunner(
+            action=action,
+            symbol=symbol,
+            quantity=quantity,
+            timeout_seconds=timeout_seconds,
+            trade_config=trade_config,
+            reset_seq_num=reset_seq_num,
+            close_position_id=close_position_id,
+            quote_config=quote_config,
+            take_profit_pct=take_profit_pct,
+            stop_loss_pct=stop_loss_pct,
+            minimal_output=minimal_output,
+        )
+    except ValueError as error:
+        print(error)
+        return 1
+
+    runner.start()
+    return 0
+
+
+def positions() -> int:
+    load_env_file(".env")
+    try:
+        action = "positions"
+        timeout_seconds = 30
+        reset_seq_num = True
+        trade_config = build_fix_config("TRADE")
+        runner = TradeRunner(
+            action=action,
+            symbol=None,
+            quantity=None,
+            timeout_seconds=timeout_seconds,
+            trade_config=trade_config,
+            reset_seq_num=reset_seq_num,
+            close_position_id=None,
+            quote_config=None,
+            take_profit_pct=None,
+            stop_loss_pct=None,
+            minimal_output=True,
+        )
+    except ValueError as error:
+        print(error)
+        return 1
+
+    runner.start()
+    return 0
+
+
+def main() -> int:
+    load_env_file(".env")
+    try:
+        (
+            action,
+            symbol,
+            quantity,
+            timeout_seconds,
+            reset_seq_num,
+            close_position_id,
+            take_profit_pct,
+            stop_loss_pct,
+        ) = read_runtime_settings()
+        minimal_output = read_output_settings()
+        trade_config = build_fix_config("TRADE")
+        quote_config = build_fix_config("QUOTE") if action in {"buy", "sell"} and (
+            take_profit_pct is not None or stop_loss_pct is not None
+        ) else None
+        runner = TradeRunner(
+            action=action,
+            symbol=symbol,
+            quantity=quantity,
+            timeout_seconds=timeout_seconds,
+            trade_config=trade_config,
+            reset_seq_num=reset_seq_num,
+            close_position_id=close_position_id,
+            quote_config=quote_config,
+            take_profit_pct=take_profit_pct,
+            stop_loss_pct=stop_loss_pct,
+            minimal_output=minimal_output,
+        )
+    except ValueError as error:
+        print(error)
+        return 1
+
+    runner.start()
+    return 0
+
+
+def transactions() -> int:
+    load_env_file(".env")
+    try:
+        action = "transactions"
+        timeout_seconds = 30
+        reset_seq_num = True
+        trade_config = build_fix_config("TRADE")
+        runner = TradeRunner(
+            action=action,
+            symbol=None,
+            quantity=None,
+            timeout_seconds=timeout_seconds,
+            trade_config=trade_config,
+            reset_seq_num=reset_seq_num,
+            close_position_id=None,
+            quote_config=None,
+            take_profit_pct=None,
+            stop_loss_pct=None,
+            minimal_output=True,
+        )
+    except ValueError as error:
+        print(error)
+        return 1
+
+    runner.start()
+    return 0
+
+
+def closeposition(position_id: str) -> int:
+    load_env_file(".env")
+    try:
+        action = "close"
+        symbol = "BTCUSD"
+        quantity = 0.01
+        timeout_seconds = 30
+        reset_seq_num = True
+        close_position_id = str(position_id)
+        minimal_output = True
+        trade_config = build_fix_config("TRADE")
+        runner = TradeRunner(
+            action=action,
+            symbol=symbol,
+            quantity=quantity,
+            timeout_seconds=timeout_seconds,
+            trade_config=trade_config,
+            reset_seq_num=reset_seq_num,
+            close_position_id=close_position_id,
+            quote_config=None,
+            take_profit_pct=None,
+            stop_loss_pct=None,
+            minimal_output=minimal_output,
+        )
+    except ValueError as error:
+        print(error)
+        return 1
+
+    runner.start()
+    return 0
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    print("Executing BUY...")
+    buy()
+    print("Executing SELL...")
+    sell()
+    print("Executing POSITIONS...")
+    positions()
+    print("Executing TRANSACTIONS...")
+    transactions()
+    print("Close position")
+    closeposition("52500733")
+
