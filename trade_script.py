@@ -44,7 +44,13 @@ def load_env_file(path: str) -> None:
 
 
 def get_env(name: str, default: str | None = None, required: bool = False) -> str:
-    value = os.getenv(name, default)
+    value = os.getenv(name)
+    if value is None and name.upper() != name:
+        value = os.getenv(name.upper())
+    if value is None and name.lower() != name:
+        value = os.getenv(name.lower())
+    if value is None:
+        value = default
     if required and (value is None or value == ""):
         raise ValueError(f"Missing required environment variable: {name}")
     return value or ""
@@ -129,15 +135,26 @@ def read_output_settings() -> bool:
     return str_to_bool(get_env("MINIMAL_OUTPUT", "false"))
 
 
+def apply_cli_action_override() -> None:
+    if len(sys.argv) < 2:
+        return
+    cli_action = sys.argv[1].strip().lower()
+    if cli_action in {"positions", "buy", "sell", "close", "transactions"}:
+        os.environ["TRADE_ACTION"] = cli_action
+
+
 def read_runtime_settings() -> tuple[str, str, float, int, bool, str, float | None, float | None]:
-    action = get_env("TRADE_ACTION", "positions").lower()
+    close_position_id = get_env("TRADE_POSITION_ID", "").strip()
+    action_default = "close" if close_position_id else "positions"
+    action = get_env("TRADE_ACTION", action_default).lower()
+    if close_position_id and action == "positions":
+        action = "close"
     if action not in {"positions", "buy", "sell", "close", "transactions"}:
         raise ValueError("TRADE_ACTION must be one of: positions, buy, sell, close, transactions")
     symbol = get_env("TRADE_SYMBOL", "BTCUSD")
     quantity = float(get_env("TRADE_QTY", "0.01"))
     timeout_seconds = int(get_env("TRADE_TIMEOUT", "20"))
     reset_seq_num = str_to_bool(get_env("FIX_RESET_SEQ_NUM", "true"))
-    close_position_id = get_env("TRADE_POSITION_ID", "")
     take_profit_pct = parse_optional_float("EXIT_TAKE_PROFIT_PCT")
     stop_loss_pct = parse_optional_float("EXIT_STOP_LOSS_PCT")
     return (
@@ -238,6 +255,10 @@ class TradeRunner:
         if not self.minimal_output:
             print(message)
 
+    @staticmethod
+    def out(message: str) -> None:
+        print(message)
+
     def on_connected(self, client: Client) -> None:
         self.log("Connected to cTrader TRADE FIX endpoint")
         self.log(
@@ -293,7 +314,7 @@ class TradeRunner:
                 "position_type": response.getFieldValue(703),
             }
             self.collected_positions.append(position)
-            print(f"Position report #{self.position_reports_count}: {position}")
+            self.log(f"Position report #{self.position_reports_count}: {position}")
             return
 
         if self.action == "close" and msg_type == "AP":
@@ -306,7 +327,7 @@ class TradeRunner:
                 "position_type": response.getFieldValue(703),
             }
             self.collected_positions.append(position)
-            print(f"Close candidate: {position}")
+            self.log(f"Close candidate: {position}")
             return
 
         if self.action == "positions" and isinstance(msg_type, list) and "AP" in msg_type:
@@ -317,7 +338,7 @@ class TradeRunner:
             settl_prices = response.getFieldValue(730)
             count = len(position_ids) if isinstance(position_ids, list) else msg_type.count("AP")
             self.position_reports_count += count
-            print(f"Position reports received in batch: count={count}")
+            self.log(f"Position reports received in batch: count={count}")
             if isinstance(position_ids, list) and isinstance(symbols, list):
                 for idx in range(min(len(position_ids), len(symbols))):
                     long_qty = long_qtys[idx] if isinstance(long_qtys, list) and idx < len(long_qtys) else long_qtys
@@ -331,7 +352,7 @@ class TradeRunner:
                         "settl_price": settl_price,
                     }
                     self.collected_positions.append(position)
-                    print(f"Position report(batch) #{idx + 1}: {position}")
+                    self.log(f"Position report(batch) #{idx + 1}: {position}")
             return
 
         if self.action == "close" and isinstance(msg_type, list) and "AP" in msg_type:
@@ -341,7 +362,7 @@ class TradeRunner:
             short_qtys = response.getFieldValue(705)
             settl_prices = response.getFieldValue(730)
             count = len(position_ids) if isinstance(position_ids, list) else msg_type.count("AP")
-            print(f"Close candidates received in batch: count={count}")
+            self.log(f"Close candidates received in batch: count={count}")
             if isinstance(position_ids, list) and isinstance(symbols, list):
                 for idx in range(min(len(position_ids), len(symbols))):
                     long_qty = long_qtys[idx] if isinstance(long_qtys, list) and idx < len(long_qtys) else long_qtys
@@ -355,7 +376,7 @@ class TradeRunner:
                         "settl_price": settl_price,
                     }
                     self.collected_positions.append(position)
-                    print(f"Close candidate(batch) #{idx + 1}: {position}")
+                    self.log(f"Close candidate(batch) #{idx + 1}: {position}")
             return
 
         if self.action == "transactions" and (msg_type == "8" or (isinstance(msg_type, list) and "8" in msg_type)):
@@ -395,7 +416,7 @@ class TradeRunner:
                     "reason": response.getFieldValue(58),
                     "reject_reason_code": response.getFieldValue(380),
                 }
-                print(f"Business message reject: {reject}")
+                self.log(f"Business message reject: {reject}")
                 self.finish()
                 return
 
@@ -408,7 +429,7 @@ class TradeRunner:
                     "reason": response.getFieldValue(58),
                     "reject_reason_code": response.getFieldValue(380),
                 }
-                print(f"Business message reject(batch): {reject}")
+                self.log(f"Business message reject(batch): {reject}")
                 self.finish()
 
     def on_quote_message(self, client: Client, response) -> None:
@@ -653,7 +674,7 @@ class TradeRunner:
                     break
 
         if target is None:
-            print(
+            self.out(
                 "Close target not found. "
                 f"position_id_filter={self.close_position_id or 'auto-by-symbol'} "
                 f"symbol={self.symbol}"
@@ -664,7 +685,7 @@ class TradeRunner:
         long_qty = float(target.get("long_qty") or 0)
         short_qty = float(target.get("short_qty") or 0)
         if long_qty <= 0 and short_qty <= 0:
-            print(f"Target position has no open quantity: {target}")
+            self.out(f"Target position has no open quantity: {target}")
             self.finish()
             return
 
@@ -682,7 +703,7 @@ class TradeRunner:
         order.OrdType = "1"
         order.PosMaintRptID = position_id
         self.client.send(order)
-        print(
+        self.log(
             "CLOSE order sent: "
             f"ClOrdID={self.sent_id}, position_id={position_id}, symbol={symbol}, "
             f"side={close_side}, qty={close_qty}"
@@ -820,7 +841,7 @@ class TradeRunner:
     def on_timeout(self) -> None:
         if self.completed:
             return
-        print(f"Timeout after {self.timeout_seconds}s")
+        self.out(f"Timeout after {self.timeout_seconds}s")
         self.finish()
 
     def finish(self) -> None:
@@ -840,7 +861,7 @@ def sell() -> int:
     try:
         action = "sell"
         symbol = "BTCUSD"
-        quantity = 0.02
+        quantity = 0.01
         timeout_seconds = 30
         reset_seq_num = True
         close_position_id = None
@@ -878,7 +899,7 @@ def buy() -> int:
     try:
         action = "buy"
         symbol = "BTCUSD"
-        quantity = 0.02
+        quantity = 0.01
         timeout_seconds = 30
         reset_seq_num = True
         close_position_id = None
@@ -940,6 +961,7 @@ def positions() -> int:
 
 def main() -> int:
     load_env_file(".env")
+    apply_cli_action_override()
     try:
         (
             action,
@@ -1038,14 +1060,4 @@ def closeposition(position_id: str) -> int:
 
 
 if __name__ == "__main__":
-    print("Executing BUY...")
-    buy()
-    print("Executing SELL...")
-    sell()
-    print("Executing POSITIONS...")
-    positions()
-    print("Executing TRANSACTIONS...")
-    transactions()
-    print("Close position")
-    closeposition("52500733")
-
+    sys.exit(main())
