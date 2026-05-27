@@ -752,17 +752,15 @@ class TradeRunner:
 def main() -> int:
     load_env_file(".env")
     try:
-        (
-            action,
-            symbol,
-            quantity,
-            timeout_seconds,
-            reset_seq_num,
-            close_position_id,
-            take_profit_pct,
-            stop_loss_pct,
-        ) = read_runtime_settings()
-        minimal_output = read_output_settings()
+        action = "sell"
+        symbol = "BTCUSD"
+        quantity = 0.02
+        timeout_seconds = 30
+        reset_seq_num = True
+        close_position_id = None
+        take_profit_pct = None
+        stop_loss_pct = None
+        minimal_output = True
         trade_config = build_fix_config("TRADE")
         quote_config = build_fix_config("QUOTE") if action in {"buy", "sell"} and (
             take_profit_pct is not None or stop_loss_pct is not None
