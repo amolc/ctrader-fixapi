@@ -221,14 +221,16 @@ class FIX:
         position_list_callback,
         order_list_callback,
         update_fix_status=None,
+        quote_port: int = 5201,
+        trade_port: int = 5202,
     ):
         try:
             self.qstream = Buffer()
             self.qs = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.qs.connect((server, 5201))
+            self.qs.connect((server, quote_port))
             self.tstream = Buffer()
             self.ts = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.ts.connect((server, 5202))
+            self.ts.connect((server, trade_port))
             self.broker = broker
             self.login = login
             self.password = password
@@ -263,6 +265,7 @@ class FIX:
             self.origin_to_pos_id = {}
             self.origin_to_ord_id = {}
             self.logged = False
+            self.position_open_times = {}
             self.logon()
             self.sec_list_evt = threading.Event()
             self.thread_sec_list = threading.Thread(target=self.sec_list)

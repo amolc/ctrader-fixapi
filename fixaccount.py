@@ -27,6 +27,8 @@ def normalize_config(config: dict) -> dict:
         'server': row.get('TRADE_HOST') or row.get('Host'),
         'sender_comp_id': row.get('FIX_SENDER_COMP_ID') or row.get('SenderCompID'),
         'password': row.get('FIX_PASSWORD') or row.get('Password'),
+        'quote_port': int(row.get('QUOTE_PORT', 5201)),
+        'trade_port': int(row.get('TRADE_PORT', 5202)),
     }
 
 
@@ -71,7 +73,9 @@ class FixAccount:
                 self.config['server'],
                 self.config['sender_comp_id'],
                 self.config['password'],
-                debug=False
+                debug=False,
+                quote_port=self.config.get('quote_port', 5201),
+                trade_port=self.config.get('trade_port', 5202)
             )
             time.sleep(wait_seconds)
             self.connected = self.api.isconnected()

@@ -18,6 +18,8 @@ class Ctrader:
         client_id=1,
         spread=0.00005,
         debug=True,
+        quote_port=5201,
+        trade_port=5202,
     ):
         """AI is creating summary for __init__
 
@@ -58,6 +60,8 @@ class Ctrader:
             c["_id"],
             self.position_list_callback,
             self.order_list_callback,
+            quote_port=quote_port,
+            trade_port=trade_port,
         )
         self.market_data_list = {}
         self.symbol_table = SYMBOLSLIST["default"]
